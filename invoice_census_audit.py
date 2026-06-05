@@ -652,13 +652,27 @@ TYPE B – Per-subscriber comparison grids (e.g. "Monthly Premium Comparison Det
     Do NOT collapse multiple subscribers into one entry per tier — every row must be its own JSON object.
     Use the coverage type column (EMP/ESP/ECH/FAM or EE/ES/EC/FAM) to populate the "tier" field.
 
-TYPE C – Current vs Alternate/Renewal comparison tables (e.g. ADP proposals):
-  These tables display a "Current" plan design/rate on the left and one or more "Alternate Plans" on the right.
-  The "Alternate Plans" represent the new/renewal plans and rates.
-  → For each tier (EE/ES/EC/EF), extract the rates where:
-    - `current_monthly` is the premium from the "Current" column.
-    - `renewal_monthly` is the premium from the "Alternate Plans" column.
-    - For the `plan_name`, prefer the renewal/alternate plan name (e.g., "OXF-LIB ACC PPO 3B 0-100-NY") if it differs from the current plan name. If there are multiple alternate plans, output a JSON entry for each alternate plan, using its respective name and renewal rate.
+TYPE C – Current vs Alternate/Renewal comparison tables (e.g. ADP "Monthly Plan/Contribution Report"):
+  These tables have THREE columns side by side: "Current" (left), "Renew My Current Plans" (middle), "Alternate Plans" (right).
+  CRITICAL DISTINCTION — the two right columns mean very different things:
+
+  MIDDLE column "Renew My Current Plans":
+    → This IS the true renewal of the employee's existing plan. Extract it as:
+         plan_name       = the CURRENT plan name (left column header)
+         current_monthly = premium from the "Current" column
+         renewal_monthly = premium from the "Renew My Current Plans" (middle) column  ← CORRECT RENEWAL
+
+  RIGHT column "Alternate Plans":
+    → This is a completely DIFFERENT plan the employee could optionally switch to.
+       It has NO "renewal" in the traditional sense — its rate IS its own standalone rate.
+    → Extract it as a SEPARATE entry:
+         plan_name       = the ALTERNATE plan name (right column header)
+         current_monthly = premium from the "Alternate Plans" column
+         renewal_monthly = premium from the "Alternate Plans" column  (same value — it is its own rate)
+    → DO NOT use the alternate plan's premium as the renewal_monthly for the current plan.
+
+  If there are multiple alternate plans shown on the right, output a separate JSON entry for each.
+  If a page only has two columns (Current + Renew), treat the right column as the renewal (no alternate).
 
 COVERAGE TYPE → TIER mapping (for all formats):
   EMP or EE  → "Employee"
@@ -900,11 +914,21 @@ def match_and_reconcile(
             premium_key = (norm_plan, cr.monthly_premium)
             premium_rate = premium_lookup.get(premium_key)
             if premium_rate is None:
-                # Tolerance scan for floating-point imprecision
+                # Tolerance scan for floating-point imprecision.
+                # Prefer a rate whose plan name matches the census plan name exactly
+                # before falling back to any plan with the same premium amount.
+                best_premium_rate = None
                 for (rp, ramt), rate in premium_lookup.items():
                     if abs(ramt - cr.monthly_premium) <= 0.05:
-                        premium_rate = rate
-                        break
+                        if rp == norm_plan:
+                            # Exact plan-name match wins immediately — stop scanning
+                            best_premium_rate = rate
+                            break
+                        elif best_premium_rate is None:
+                            # Keep as fallback only if nothing better found yet
+                            best_premium_rate = rate
+                premium_rate = best_premium_rate
+
 
             if premium_rate:
                 cr.renewal_amount = premium_rate.renewal_monthly
