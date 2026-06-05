@@ -1298,11 +1298,19 @@ def main() -> None:
         else:
             rates, text = extract_rates_with_ocr(pdf, poppler_path=poppler_path)
 
+        # Strip any leading UUID job-id prefix (e.g. "<uuid>_original.pdf" → "original.pdf")
+        # so the saved file is named after the original input file, not the server-side temp name.
+        _uuid_prefix_re = re.compile(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_',
+            re.IGNORECASE,
+        )
+        display_pdf_name = _uuid_prefix_re.sub('', pdf.name)
+
         all_rates.extend(rates)
-        all_text += f"\n{'='*60}\nFile: {pdf.name}\n{'='*60}\n{text}\n"
+        all_text += f"\n{'='*60}\nFile: {display_pdf_name}\n{'='*60}\n{text}\n"
 
         # Save extracted text per PDF
-        save_extracted_text(text, pdf.name, extracted_text_dir)
+        save_extracted_text(text, display_pdf_name, extracted_text_dir)
 
     if not all_rates:
         log.error("No renewal rates extracted from invoices. Check the PDF files.")
