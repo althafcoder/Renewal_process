@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import subprocess
 import uuid
@@ -123,7 +124,10 @@ async def process_renewal(
         invoice_path = INPUT_DIR / f"{job_id}_{invoice.filename}"
         census_path = INPUT_DIR / f"{job_id}_{census.filename}"
         census_stem = Path(census.filename).stem
-        out_census_name = f"{census_stem}_updated_census_{job_id}.xlsx"
+        # Strip any leading UUID job-prefix (e.g. "<uuid>_original" → "original")
+        _uuid_re = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_', re.IGNORECASE)
+        clean_census_stem = _uuid_re.sub('', census_stem)
+        out_census_name = f"{clean_census_stem}_updated_census_{job_id}.xlsx"
         out_census_path = OUTPUT_DIR / out_census_name
         log_path = OUTPUT_DIR / f"logs_{job_id}.txt"
 
@@ -210,7 +214,9 @@ async def delete_job(job_id: str):
     invoice_path = INPUT_DIR / f"{job_id}_{job['invoice_name']}"
     census_path = INPUT_DIR / f"{job_id}_{job['census_name']}"
     census_stem = Path(job['census_name']).stem
-    out_census_path = OUTPUT_DIR / f"{census_stem}_updated_census_{job_id}.xlsx"
+    _uuid_re = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_', re.IGNORECASE)
+    clean_census_stem = _uuid_re.sub('', census_stem)
+    out_census_path = OUTPUT_DIR / f"{clean_census_stem}_updated_census_{job_id}.xlsx"
     rates_json_path = OUTPUT_DIR / f"extracted_rates_{job_id}.json"
     log_path = OUTPUT_DIR / f"logs_{job_id}.txt"
     

@@ -161,17 +161,18 @@ def detect_census_type(ws, max_check_row: int = 5) -> int:
     """
     Auto-detect census template type by scanning the first few rows.
 
-    Type 2 signatures: all of ("Employee Name", "Plan Enrolled",
-    "Coverage Tier", "Home Zip Code") appear in one row.
+    Type 2 signatures: "Employee Name" + "Coverage Tier" + "Home Zip Code" must
+    appear together with at least one of "Plan Enrolled" or "Plan Name" in one row.
     Returns 2 if Type 2, else 1 (default / Type 1).
     """
-    type2_signatures = {"Employee Name", "Plan Enrolled", "Coverage Tier", "Home Zip Code"}
+    type2_required = {"Employee Name", "Coverage Tier", "Home Zip Code"}
+    type2_plan_variants = {"Plan Enrolled", "Plan Name"}
     for r in range(1, max_check_row + 1):
         row_vals = {
             str(ws.cell(row=r, column=c).value or "").strip()
             for c in range(1, ws.max_column + 1)
         }
-        if type2_signatures.issubset(row_vals):
+        if type2_required.issubset(row_vals) and row_vals & type2_plan_variants:
             log.info("  Detected Type 2 census template at row %d", r)
             return 2
     log.info("  Detected Type 1 census template")
@@ -238,14 +239,20 @@ def ingest_census(
             continue  # Skip empty rows
 
         ee_row_val = ws.cell(row=r, column=col_ee_row).value
-        ee_row = int(ee_row_val) if ee_row_val is not None else None
+        try:
+            ee_row = int(ee_row_val) if ee_row_val is not None else None
+        except (ValueError, TypeError):
+            ee_row = None  # non-numeric value in EE Row column — treat as absent
 
         last_name = str(ws.cell(row=r, column=col_last_name).value or "")
         gender = str(ws.cell(row=r, column=col_gender).value or "")
         dob = str(ws.cell(row=r, column=col_dob).value or "")
         relationship = str(ws.cell(row=r, column=col_relationship).value or "")
         dep_of_val = ws.cell(row=r, column=col_dependent_of).value
-        dependent_of = int(dep_of_val) if dep_of_val is not None else None
+        try:
+            dependent_of = int(dep_of_val) if dep_of_val is not None else None
+        except (ValueError, TypeError):
+            dependent_of = None  # non-numeric value in Dependent Of column — treat as absent
         coverage = str(ws.cell(row=r, column=col_coverage).value or "")
         cobra = str(ws.cell(row=r, column=col_cobra).value or "")
 
@@ -323,14 +330,17 @@ def ingest_census_type2(
 
     log.info("  Headers found: %s", list(headers.keys()))
 
-    # Column indices – use sensible defaults if a header is missing
+    # Column indices – use sensible defaults if a header is missing.
+    # Accept alternative header names used by different census variants.
     col_name     = headers.get("Employee Name", 1)
     col_gender   = headers.get("Gender", 2)
     col_dob      = headers.get("Date of Birth", 3)
     col_coverage = headers.get("Coverage Tier", 5)
     col_cobra    = headers.get("COBRA", 6)
-    col_plan     = headers.get("Plan Enrolled", 7)
-    col_premium  = headers.get("Current Premium", 8)
+    col_plan     = headers.get("Plan Enrolled",
+                   headers.get("Plan Name", 7))          # «Plan Name» variant
+    col_premium  = headers.get("Current Premium",
+                   headers.get("Monthly Premium", 8))    # «Monthly Premium» variant
     col_renewal  = headers.get("Renewal", 9)
 
     log.info(
@@ -625,9 +635,17 @@ def extract_rates_with_llm(pdf_path: Path, poppler_path: str = None) -> Tuple[Li
         log.info("  Page %d: Selected for rate extraction (text extraction method: %s)", i, method)
         premium_pages.append((i, page_text))
 
-    # Process in batches of 3 pages
-    for batch_start in range(0, len(premium_pages), 3):
+    # Process pages with an overlapping window so that plans split across consecutive pages
+    # (e.g. Current on page N, Renewal on page N+1) are always seen in the same LLM call.
+    # We use a stride of 2 with a window of 3: batches are [0-2], [2-4], [4-6] ...
+    # This means every boundary page is included in two consecutive batches, ensuring
+    # cross-page continuations are always sent together.
+    batch_stride = 2  # advance by 2 so each boundary page overlaps
+    for batch_start in range(0, len(premium_pages), batch_stride):
         batch = premium_pages[batch_start:batch_start + 3]
+        # Avoid sending duplicate-only batches at the tail
+        if batch_start > 0 and len(batch) == 1 and len(premium_pages) % batch_stride == 1:
+            break
 
         prompt_text = """Analyze these benefits renewal PDF pages. Extract ALL plan premium rate tables you find.
 
@@ -673,6 +691,49 @@ TYPE C – Current vs Alternate/Renewal comparison tables (e.g. ADP "Monthly Pla
 
   If there are multiple alternate plans shown on the right, output a separate JSON entry for each.
   If a page only has two columns (Current + Renew), treat the right column as the renewal (no alternate).
+
+TYPE D – Multi-plan side-by-side pages with cross-page splits (CRITICAL — read carefully):
+
+  These PDFs use a 3-column-per-page layout where each page shows three plan columns.
+  Each plan column is labelled either "Current Plan" or "Renewal Plan" at the top.
+
+  YEAR-SUFFIX NAMING CONVENTION:
+  → Plan names ending in "25 CNT" or "2025" = the CURRENT year plan (effective 2025)
+  → Plan names ending in "26 CNT" or "2026" = the RENEWAL year plan (effective 2026)
+  → A "25 CNT" plan and its matching "26 CNT" plan ARE THE SAME PLAN — just different contract years.
+  → The "Current Plan" column with the "25 CNT" name holds current_monthly amounts.
+  → The "Renewal Plan" column with the "26 CNT" name holds renewal_monthly amounts.
+
+  COLUMN PAIRING RULE — always pair columns in LEFT-TO-RIGHT order on each page:
+    Column 1 and Column 2 on a page = one (current, renewal) pair for one plan.
+    Column 3 on that page = the CURRENT half of the NEXT plan (its renewal is on the NEXT page, column 1).
+
+  WORKED EXAMPLE (exactly matching what you will see):
+    Page N — three columns:
+      Col 1: "Current Plan"  NY S LBTY NG 30/75/4000/50 EPO 25 CNT → rates: EE=$1,042.14, ES=$2,084.28, EC=$1,771.63, FAM=$2,970.09
+      Col 2: "Renewal Plan"  NY S LBTY NG 30/75/4000/50 EPO 26 CNT → rates: EE=$1,184.43, ES=$2,368.87, EC=$2,013.53, FAM=$3,375.64
+      Col 3: "Current Plan"  NY S LBTY NG 40/80/3250/60 EPO 25 CNT → rates: EE=$1,059.30, ES=$2,118.60, EC=$1,800.81, FAM=$3,019.00
+
+    Page N+1 — three columns:
+      Col 1: "Renewal Plan"  NY S LBTY NG 40/80/3250/60 EPO 26 CNT → rates: EE=$1,204.01, ES=$2,408.02, EC=$2,046.82, FAM=$3,431.43
+      Col 2: "Current Plan"  NY S MTRO NG 30/80/3750/60 EPO ME 25 CNT → rates: EE=$970.21, ...
+      Col 3: "Renewal Plan"  NY S MTRO NG 30/80/3750/60 EPO ME 26 CNT → rates: EE=$1,120.35, ...
+
+  CORRECT OUTPUT for the above:
+    Plan "NY S LBTY NG 30/75/4000/50 EPO 25 CNT":
+      → current_monthly=1042.14,  renewal_monthly=1184.43   ← Col 1 current paired with Col 2 renewal (same page)
+    Plan "NY S LBTY NG 40/80/3250/60 EPO 25 CNT":
+      → current_monthly=1059.30,  renewal_monthly=1204.01   ← Col 3 current (page N) paired with Col 1 renewal (page N+1)
+    Plan "NY S MTRO NG 30/80/3750/60 EPO ME 25 CNT":
+      → current_monthly=970.21,   renewal_monthly=1120.35   ← Col 2 current paired with Col 3 renewal (same page)
+
+  CRITICAL MISTAKES TO AVOID:
+  ✗ WRONG: Pairing NY S LBTY NG 40/80/... 25 CNT (current=1059.30) with the renewal of the PREVIOUS plan (1184.43).
+  ✗ WRONG: Treating NY S LBTY NG 40/80/... 26 CNT as a standalone plan with current=1204.01 and renewal=1204.01.
+  ✓ CORRECT: Always pair each "25 CNT" current column with its matching "26 CNT" renewal column — whether they are on the same page or on consecutive pages.
+
+  USE THE CURRENT-YEAR PLAN NAME (ending in "25 CNT" or "2025") as the plan_name in the JSON output.
+  Do NOT output a separate entry for the renewal-year plan name (e.g., "26 CNT") — it is not a different plan.
 
 COVERAGE TYPE → TIER mapping (for all formats):
   EMP or EE  → "Employee"
@@ -1271,8 +1332,37 @@ def main() -> None:
             header_row=header_row,
         )
     else:
-        # Type 1: complex layout, header row from CLI arg (default 21)
-        header_row = args.header_row
+        # Type 1: complex layout. Try to auto-detect the real header row by
+        # scanning rows 1-40 for a row that contains known column header keywords.
+        # Falls back to the CLI arg (default 21) if nothing is found.
+        header_row = args.header_row  # start with CLI default
+        wb_scan = load_workbook(str(census_path), data_only=True)
+        ws_scan = wb_scan[sheet_name]
+        _type1_header_keywords = {
+            "first name", "last name", "ee row", "coverage type",
+            "current plan description", "monthly total premium",
+            "relation-ship to employee", "relationship to employee",
+            "date of birth", "renewal",
+        }
+        for _r in range(1, min(41, ws_scan.max_row + 1)):
+            _row_vals = {
+                str(ws_scan.cell(row=_r, column=_c).value or "").strip().lower()
+                for _c in range(1, ws_scan.max_column + 1)
+            }
+            _matches = _row_vals & _type1_header_keywords
+            if len(_matches) >= 3:  # require at least 3 known header keywords
+                header_row = _r
+                log.info(
+                    "  Auto-detected Type 1 header row at row %d (matched: %s)",
+                    header_row, ", ".join(sorted(_matches)),
+                )
+                break
+        else:
+            log.info(
+                "  Header row auto-detection found nothing; using default row %d",
+                header_row,
+            )
+        wb_scan.close()
         census_rows = ingest_census(
             census_path,
             sheet=sheet_name,
