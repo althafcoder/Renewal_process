@@ -766,8 +766,21 @@ Here is the layout-preserved extracted text for the pages:
                 max_tokens=4096,
                 temperature=0,
             )
-
             result_text = response.choices[0].message.content.strip()
+            
+            try:
+                from core.universal_token_monitor import track_usage
+                track_usage(
+                    response_usage=response.usage,
+                    model="gpt-4o",
+                    poc_name="RENEWAL_PROCESS",
+                    file_name=pdf_path.name if hasattr(pdf_path, 'name') else str(pdf_path),
+                    step_name="invoice_rate_extraction"
+                )
+            except Exception as e:
+                log.warning("  Failed to log token usage: %s", e)
+
+
             # Clean up markdown code fences if present
             if result_text.startswith("```"):
                 result_text = re.sub(r"^```(?:json)?\s*", "", result_text)
