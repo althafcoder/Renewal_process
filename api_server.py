@@ -7,11 +7,24 @@ import shutil
 import asyncio
 import time
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+
+# ── Universal logging (poc_db) ─────────────────────────────────────────────────
+try:
+    import importlib.util as _ilu
+    _WORKSPACE_DIR = Path(__file__).resolve().parent.parent
+    _poc_db_path = _WORKSPACE_DIR / "database" / "poc_db.py"
+    _spec = _ilu.spec_from_file_location("database.poc_db", str(_poc_db_path))
+    _poc_db_mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_poc_db_mod)
+    log_renewal_run = _poc_db_mod.log_renewal_run
+except Exception as _e:
+    print(f"[WARN] Renewal api_server: could not load poc_db: {_e}")
+    def log_renewal_run(*args, **kwargs): pass
 
 app = FastAPI(title="Renewal Intellect API")
 
@@ -32,9 +45,13 @@ OUTPUT_DIR = BASE_DIR / "output"
 INPUT_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Serve the output directory statically for downloads
-app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
-
+# app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+@app.get("/output/{filename:path}")
+async def get_output_file(filename: str):
+    file_path = OUTPUT_DIR / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(file_path), filename=file_path.name)
 # In-memory database of jobs
 # job_id -> {
 #     "job_id": str,
@@ -51,8 +68,16 @@ app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 # }
 jobs = {}
 
-def run_pipeline_sync(job_id: str, command: list, out_census_path: Path, log_path: Path):
+def run_pipeline_sync(job_id: str, command: list, out_census_path: Path, log_path: Path, sub_env: dict = None):
     jobs[job_id]["status"] = "processing"
+    processed_by = jobs[job_id].get("processed_by", "SYSTEM")
+    log_renewal_run(
+        job_id=job_id,
+        census_name=jobs[job_id].get("census_name", ""),
+        invoice_name=jobs[job_id].get("invoice_name", ""),
+        status="STARTED",
+        processed_by=processed_by,
+    )
     
     try:
         log_path.parent.mkdir(exist_ok=True)
@@ -65,7 +90,8 @@ def run_pipeline_sync(job_id: str, command: list, out_census_path: Path, log_pat
             text=True,
             encoding="utf-8",
             errors="ignore",
-            cwd=str(BASE_DIR)
+            cwd=str(BASE_DIR),
+            env=sub_env
         )
         
         # Stream stdout line by line as it is produced
@@ -90,11 +116,27 @@ def run_pipeline_sync(job_id: str, command: list, out_census_path: Path, log_pat
             jobs[job_id]["download_url"] = f"http://localhost:8000/output/{out_census_path.name}"
             jobs[job_id]["rates_json_url"] = f"http://localhost:8000/output/extracted_rates_{job_id}.json"
             print(f"Job {job_id} completed successfully.", flush=True)
+            log_renewal_run(
+                job_id=job_id,
+                census_name=jobs[job_id].get("census_name", ""),
+                invoice_name=jobs[job_id].get("invoice_name", ""),
+                status="SUCCESS",
+                download_url=jobs[job_id]["download_url"],
+                processed_by=jobs[job_id].get("processed_by", "SYSTEM"),
+            )
         else:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["completed_at"] = time.time()
             jobs[job_id]["error"] = f"Pipeline process exited with returncode {process.returncode}."
             print(f"Job {job_id} failed with returncode {process.returncode}.", flush=True)
+            log_renewal_run(
+                job_id=job_id,
+                census_name=jobs[job_id].get("census_name", ""),
+                invoice_name=jobs[job_id].get("invoice_name", ""),
+                status="FAILED",
+                error_message=jobs[job_id]["error"],
+                processed_by=jobs[job_id].get("processed_by", "SYSTEM"),
+            )
             
     except Exception as e:
         import traceback
@@ -113,6 +155,7 @@ def run_pipeline_sync(job_id: str, command: list, out_census_path: Path, log_pat
 
 @app.post("/api/process")
 async def process_renewal(
+    request: Request,
     invoice: UploadFile = File(...),
     census: UploadFile = File(...)
 ):
@@ -143,15 +186,15 @@ async def process_renewal(
         census_size = len(census_contents)
             
         # Run the backend python script as a subprocess
-        # Search for python in venv (Windows: Scripts, Linux/macOS: bin)
-        python_exe = str(BASE_DIR / "venv" / "Scripts" / "python.exe")
-        if not os.path.exists(python_exe):
-            python_exe = str(BASE_DIR / "venv" / "bin" / "python")
-            if not os.path.exists(python_exe):
-                python_exe = "python"
-        
+        # Prefer the workspace virtual environment if available, otherwise fallback to sys.executable
+        workspace_venv = BASE_DIR.parent.parent / "venv" / "Scripts" / "python.exe"
+        python_exe = str(workspace_venv) if workspace_venv.exists() else sys.executable
+            
         script_path = str(BASE_DIR / "invoice_census_audit.py")
         
+        # Capture caller identity from headers
+        processed_by = request.headers.get("X-User-Email") or request.headers.get("x-user-email") or "SYSTEM"
+
         command = [
             python_exe,
             "-u",  # Unbuffered binary stdout and stderr
@@ -160,6 +203,12 @@ async def process_renewal(
             "--invoices", str(invoice_path),
             "--out-census", str(out_census_path)
         ]
+
+        # Inject WORKSPACE path so subprocess can find core.universal_token_monitor
+        sub_env = os.environ.copy()
+        workspace_dir = str(Path(__file__).resolve().parent.parent)
+        existing_pythonpath = sub_env.get("PYTHONPATH", "")
+        sub_env["PYTHONPATH"] = workspace_dir + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
         
         # Initialize job metadata
         jobs[job_id] = {
@@ -174,11 +223,12 @@ async def process_renewal(
             "download_url": None,
             "rates_json_url": None,
             "error": None,
-            "logs": ""
+            "logs": "",
+            "processed_by": processed_by,
         }
         
         # Start worker task in a background thread to prevent Blocking IOError & Windows loop limits
-        asyncio.create_task(asyncio.to_thread(run_pipeline_sync, job_id, command, out_census_path, log_path))
+        asyncio.create_task(asyncio.to_thread(run_pipeline_sync, job_id, command, out_census_path, log_path, sub_env))
         
         # Return job info immediately (without full logs)
         return JSONResponse({k: v for k, v in jobs[job_id].items() if k != "logs"})
