@@ -30,9 +30,18 @@ import logging
 import os
 import re
 import sys
+import time
 import base64
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import core_gpu
+except ImportError:
+    _root_dir = Path(__file__).resolve().parent.parent
+    if str(_root_dir) not in sys.path:
+        sys.path.insert(0, str(_root_dir))
+    import core_gpu
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -475,8 +484,14 @@ def extract_layout_preserving_text(pdf_path: Path, page_index: int, image) -> Tu
     # 3. Try Tesseract OCR
     try:
         import pytesseract
+        t0 = time.time()
         text = pytesseract.image_to_string(image, config="--dpi 300 --psm 6")
-        log.info("  Page %d: Extracted via Tesseract OCR (%d chars)", page_index, len(text))
+        elapsed = time.time() - t0
+        try:
+            core_gpu.log_ocr_audit("Renewal-Process", "pytesseract", page_idx=page_index, elapsed_sec=elapsed)
+        except Exception:
+            pass
+        log.info("  Page %d: Extracted via Tesseract OCR (%d chars in %.2fs)", page_index, len(text), elapsed)
         return text, "pytesseract"
     except Exception as e:
         log.error("  Page %d: Tesseract OCR failed: %s", page_index, e)
