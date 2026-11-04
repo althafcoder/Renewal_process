@@ -33,7 +33,27 @@ INPUT_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Serve the output directory statically for downloads
-app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+@app.get("/output/{filename:path}")
+async def serve_output_file(filename: str):
+    import urllib.parse
+    decoded_name = urllib.parse.unquote(filename).strip("/\\")
+    file_path = (OUTPUT_DIR / decoded_name).resolve()
+    if not str(file_path).startswith(str(OUTPUT_DIR.resolve())) or not file_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Output file '{decoded_name}' not found")
+    
+    media_type = "application/octet-stream"
+    if file_path.suffix.lower() == ".xlsx":
+        media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    elif file_path.suffix.lower() == ".json":
+        media_type = "application/json"
+    elif file_path.suffix.lower() == ".txt":
+        media_type = "text/plain"
+
+    return FileResponse(
+        path=str(file_path),
+        filename=file_path.name,
+        media_type=media_type
+    )
 
 # In-memory database of jobs
 # job_id -> {
