@@ -2,7 +2,7 @@
 Invoice-to-Census Renewal Premium Pipeline
 ===========================================
 Extracts plan-level renewal premium rates from a Benefits Renewal PDF (image-based)
-using OpenAI GPT-4o vision, then matches each census employee's current plan + coverage
+using OpenAI gpt-5.6-terra, then matches each census employee's current plan + coverage
 tier to look up the correct renewal premium and writes it into the census.
 
 Phases:
@@ -583,7 +583,7 @@ def is_rate_page(text: str) -> bool:
 
 def extract_rates_with_llm(pdf_path: Path, poppler_path: str = None) -> Tuple[List[RenewalRate], str]:
     """
-    Extract renewal rates using OpenAI GPT-4o API (text-only).
+    Extract renewal rates using OpenAI gpt-5.6-terra API (text-only).
     Sends the layout-preserved page text of relevant pages and asks for structured rate extraction.
     Returns (list of rates, full extracted text).
     """
@@ -597,7 +597,7 @@ def extract_rates_with_llm(pdf_path: Path, poppler_path: str = None) -> Tuple[Li
 
     client = OpenAI(api_key=api_key)
 
-    log.info("Phase 2 – Extracting rates via LLM (GPT-4o text-only) from: %s", pdf_path)
+    log.info("Phase 2 – Extracting rates via LLM (gpt-5.6-terra text-only) from: %s", pdf_path)
 
     kwargs = {"dpi": 300}
     if poppler_path:
@@ -759,12 +759,12 @@ Here is the layout-preserved extracted text for the pages:
             log.info("  Sending pages %d-%d to LLM...", batch[0][0], batch[-1][0])
 
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.6-terra",
                 messages=[
                     {"role": "user", "content": prompt_text}
                 ],
-                max_tokens=4096,
-                temperature=0,
+                max_completion_tokens=4096,
+                temperature=1,
             )
 
             result_text = response.choices[0].message.content.strip()
